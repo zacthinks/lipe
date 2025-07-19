@@ -279,7 +279,7 @@ class LIPE:
     def ignored_topics(self):
         return {i for i in self.questions if self.questions[i].ignore}
 
-    def get_transitions(self, ignore_topics={-1}):
+    def get_transitions(self, ignore_topics={-1}, ignore_self_transitions=True):
         if ignore_topics is None:
             ignore_topics = set()
         else:
@@ -305,6 +305,10 @@ class LIPE:
                 transitions.append((current, next_))
 
         transitions_df = pd.DataFrame(transitions, columns=['topic', 'next_topic'])
+
+        if ignore_self_transitions:
+            transitions_df = transitions_df[transitions_df["topic"] != transitions_df["next_topic"]]
+
         return transitions_df
 
     def tabulate_transitions(self, ignore_topics={-1}):
@@ -544,42 +548,6 @@ class ProtocolQuestion:
 
         # Reassign topics in the LIPE model
         self.lipe._reassign_topics()
-
-        # Clean up the split state
-        del self._split_state
-
-    def commit_split(self, min_similarity=1.0):
-        """
-        Merge the split subtopics into the main LIPE model using BERTopic's merge_models.
-        """
-        if not hasattr(self, '_split_state'):
-            raise RuntimeError("No split has been run. Call `.split()` first.")
-
-        split_model = self._split_state['model']
-
-        # Remove the topic from the main model
-        self.lipe.model.remove_topic(self.topic_id)
-        del self.lipe.questions[self.topic_id]
-
-        # Merge the split model into the main model
-        merged_model = BERTopic.merge_models(
-            [self.lipe.model, split_model],
-            min_similarity=min_similarity
-        )
-
-        # Assign the merged model
-        self.lipe.model = merged_model
-
-        # Re-transform our original documents with the merged model
-        # This is faster than fit_transform as it doesn't retrain
-        self.lipe.topic_labels, self.lipe.topic_probs = self.lipe.model.transform(
-            self.lipe.interviewer_lines_preprocessed
-        )
-
-        # Update all related data structures
-        self.lipe.topic_info = self.lipe.model.get_topic_info()
-        self.lipe.questions = self.lipe._build_questions()
-        self.lipe.interviewer_lines['topic'] = self.lipe.topic_labels
 
         # Clean up the split state
         del self._split_state
