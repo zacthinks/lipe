@@ -22,6 +22,7 @@
 
 ## TODO
 - Saving/loading functionality
-- Topic merging/splitting. It's still very buggy and BERTopic doesn't make it easy to modify fitted models.
+- ~~Topic merging/splitting. It's still very buggy and BERTopic doesn't make it easy to modify fitted models.~~
 - Question-level EDA
+- Fit new interviewer lines
 - Example/vignette

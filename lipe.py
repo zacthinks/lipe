@@ -1,5 +1,6 @@
 import pandas as pd
 import numpy as np
+from collections import Counter
 from bertopic import BERTopic
 from umap import UMAP
 from hdbscan import HDBSCAN
@@ -102,7 +103,8 @@ class LIPE:
                  interviewer_id=0,
                  model=None,
                  min_topic_size=None,
-                 random_state=42):
+                 random_state=42,
+                 min_prob=.5):
 
         self.data = data.copy()
         self.speaker_col = speaker_col
@@ -147,10 +149,17 @@ class LIPE:
         else:
             self.interviewer_lines_preprocessed = self.interviewer_lines[self.text_col].to_list()
 
-        self.topic_labels, self.topic_probs = self.model.fit_transform(self.interviewer_lines_preprocessed)
+        topic_labels, topic_probs = self.model.fit_transform(self.interviewer_lines_preprocessed)
+        topic_labels = [t if p >= min_prob else -1 for t, p in zip(topic_labels, topic_probs)]
         self.topic_info = self.model.get_topic_info()
+        self.topic_info['Parent_Topic'] = np.nan
+        self.topic_info['Parent_Topic'] = self.topic_info['Parent_Topic'].astype('Int64')
         self.questions = self._build_questions()
-        self.interviewer_lines['topic'] = self.topic_labels
+        self.question_merges = {}
+        self.interviewer_lines['topic'] = topic_labels
+        self.interviewer_lines['topic_prob'] = topic_probs
+        counts = Counter(topic_labels)
+        self.topic_info['Count'] = self.topic_info['Topic'].map(counts)
 
     def _load_topic_model(self, random_state=42):
         embed_model = SentenceTransformer(self.embedding_model_name)
@@ -169,20 +178,27 @@ class LIPE:
                         hdbscan_model=hdbscan_model,
                         min_topic_size=self.min_topic_size)
 
+    @property
+    def topic_map(self):
+        return {q.topic_id: q.root_topic for q in self.questions.values()}
+
+    def next_question_index(self):
+        return max(self.questions.keys()) + 1
+
     def _build_questions(self):
         questions = {}
         for topic_id in self.topic_info['Topic'].unique():
             questions[topic_id] = ProtocolQuestion(topic_id, self)
         return questions
 
-    def detailed_examples(self, topics=None, n=5, example_type='mixed', show_unprocessed=True):
+    def detailed_examples(self, topics=None, n=5, show_processed=False):
         """
         Return example interviewer docs from selected topic(s).
 
         Parameters:
         - topics: int or list of ints. If None, includes all topics.
         - n: number of examples per topic
-        - example_type: one of ['representative', 'random', 'mixed']
+        - show_processed: some encoding models require processing of texts--if true, show these processed versions, if not show raw texts
 
         Returns:
         - DataFrame with topic_id, count, words, and example docs
@@ -193,45 +209,28 @@ class LIPE:
             topics = self.topic_info['Topic'].unique().tolist()
 
         info = []
-        all_docs = self.model.get_document_info(self.interviewer_lines_preprocessed)
-        if show_unprocessed:
-            all_docs.Document = self.interviewer_lines.text.to_list()
+        all_docs = self.interviewer_lines.copy()
+        if show_processed:
+            all_docs[self.text_col] = self.interviewer_lines_preprocessed
 
         for topic_id in topics:
-            if topic_id == -1 or topic_id not in self.topic_info['Topic'].values:
+            if topic_id not in self.topic_info['Topic'].values:
                 continue
 
-            docs = all_docs[all_docs.Topic == topic_id]
+            all_descendants = self.questions[topic_id].merged_descendants
+
+            docs = all_docs[all_docs['topic'].isin(all_descendants)]
             count = len(docs)
-            words = [w[0] for w in self.model.get_topic(topic_id)]
+            words = self.topic_info[self.topic_info['Topic'] == -1]['Representation'].iloc[0]
 
-            if example_type == 'representative':
-                examples = docs[docs.Representative_document]
-                if len(examples) > n:
-                    examples = examples.sample(n)
-            elif example_type == 'random':
-                examples = docs
-                if len(examples) > n:
-                    examples = examples.sample(n)
-            elif example_type == 'mixed':
-                reps = docs[docs.Representative_document]
-                if len(reps) > n / 2:
-                    reps = reps.sample(n // 2)
-
-                bal = n - len(reps)
-                others = docs[~docs.Representative_document]
-                if len(others) > bal:
-                    others = others.sample(bal)
-
-                examples = pd.concat([reps, others])
-            else:
-                raise ValueError("example_type must be one of ['representative', 'random', 'mixed']")
+            if len(docs) > n:
+                docs = docs.sample(n)
 
             info.append({
                 'topic_id': topic_id,
                 'count': count,
                 'words': words,
-                'examples': list(zip(examples['Probability'], examples['Document']))
+                'examples': list(zip(docs['topic_prob'], docs[self.text_col]))
             })
 
         return pd.DataFrame(info)
@@ -250,46 +249,29 @@ class LIPE:
             )
         return self.model.visualize_hierarchy(hierarchical_topics=self.hierarchical_topics)
 
-    def merge_topics(self, topic_ids: list, new_topic_id=None):
-        self.model.merge_topics(self.interviewer_lines[self.text_col].tolist(), topic_ids, new_topic=new_topic_id)
-        self._reassign_topics()
-
-    def split_topic(self, topic_id: int, nr_topics=None):
-        self.model.reduce_outliers(self.interviewer_lines[self.text_col].tolist(), strategy='both', threshold=0.5)
-        self.model.hierarchical_topics(self.interviewer_lines[self.text_col].tolist())
-        self._reassign_topics()
-
-    def _reassign_topics(self):
-        self.topic_labels, self.topic_probs = self.model.transform(self.interviewer_lines_preprocessed)
-        self.model.topics_ = self.topic_labels
-        if hasattr(self.model, 'probabilities_') and self.topic_probs is not None:
-            self.model.probabilities_ = self.topic_probs
-        self.model.topic_sizes_ = pd.Series(self.topic_labels).value_counts().to_dict()
-
-        self.topic_info = self.model.get_topic_info()
-        self.questions = self._build_questions()
-        self.interviewer_lines['topic'] = self.topic_labels
-
     def label_full_data(self):
         self.data['topic'] = -4
         interviewer_mask = self.data[self.speaker_col] == self.interviewer_id
-        self.data.loc[interviewer_mask, 'topic'] = self.topic_labels
+        self.data.loc[interviewer_mask, 'topic'] = self.interviewer_lines['topic']
         return self.data
 
-    def ignored_topics(self):
-        return {i for i in self.questions if self.questions[i].ignore}
+    def ignored_topics(self, include_merge_outliers=False):
+        ignored = {i for i in self.questions if self.questions[i].ignore}
+        if include_merge_outliers:
+            ignored = {i for i in ignored if self.questions[i].has_children}
+        return ignored
 
-    def get_transitions(self, ignore_topics={-1}, ignore_self_transitions=True):
+    def get_transitions(self, ignore_topics={-1}, ignore_self_transitions=True, ignore_merge_outliers=False):
         if ignore_topics is None:
             ignore_topics = set()
         else:
             ignore_topics = set(ignore_topics)
 
-        ignore_topics = self.ignored_topics().union(ignore_topics)
+        ignore_topics = self.ignored_topics(ignore_merge_outliers).union(ignore_topics)
 
         df = self.interviewer_lines[[self.interview_col, self.line_col, 'topic']].sort_values(
-            [self.interview_col, self.line_col]
-        )
+            [self.interview_col, self.line_col]).copy()
+        df['topic'] = df['topic'].map(self.topic_map)
 
         transitions = []
 
@@ -311,12 +293,16 @@ class LIPE:
 
         return transitions_df
 
-    def tabulate_transitions(self, ignore_topics={-1}):
-        transitions = self.get_transitions(ignore_topics=ignore_topics)
+    def tabulate_transitions(self, ignore_topics={-1}, ignore_self_transitions=True, ignore_merge_outliers=False):
+        transitions = self.get_transitions(ignore_topics=ignore_topics,
+                                           ignore_self_transitions=ignore_self_transitions,
+                                           ignore_merge_outliers=ignore_merge_outliers)
         return transitions.value_counts().reset_index(name='count')
 
-    def build_graph(self, ignore_topics={-1}):
-        edges = self.tabulate_transitions(ignore_topics=ignore_topics)
+    def build_graph(self, ignore_topics={-1}, ignore_self_transitions=True, ignore_merge_outliers=False):
+        edges = self.tabulate_transitions(ignore_topics=ignore_topics,
+                                          ignore_self_transitions=ignore_self_transitions,
+                                          ignore_merge_outliers=ignore_merge_outliers)
         G = nx.DiGraph()
         for _, row in edges.iterrows():
             G.add_edge(row['topic'], row['next_topic'], weight=row['count'])
@@ -325,11 +311,12 @@ class LIPE:
     def plot_graph(self,
                    min_count=0,
                    seed=42,
-                   spring_k=None,
-                   iterations=50,
-                   pos=None,
+                   spring_k=3,
+                   iterations=200,
+                   pos={-3: (-1, -1), -2: (1, 1)},
                    title="Latent Interview Protocol Graph",
                    topic_labels={-3: 'START', -2: 'END'},
+                   label_ids=False,
                    layout_adjustments=None,
                    figsize=(10, 10),
                    default_node_color='skyblue',
@@ -358,6 +345,8 @@ class LIPE:
 
         if not hasattr(self, 'graph') or self.graph is None:
             self.build_graph()
+        else:
+            print("Plotting previously built graph--rerun self.build_graph() to modify the graph.")
 
         # Filter edges
         filtered_edges = [(u, v, d) for u, v, d in self.graph.edges(data=True) if d["weight"] >= min_count]
@@ -365,8 +354,7 @@ class LIPE:
         G.add_edges_from(filtered_edges)
 
         # Base layout
-        if pos is None:
-            pos = nx.spring_layout(G, seed=seed, k=spring_k, iterations=iterations)
+        pos = nx.spring_layout(G, seed=seed, k=spring_k, iterations=iterations, pos=pos)
 
         # Apply manual layout nudges
         if layout_adjustments:
@@ -401,6 +389,8 @@ class LIPE:
             node_labels[node] = question.label if question else 'NO LABEL'
         if topic_labels:
             node_labels.update(topic_labels)
+        if label_ids:
+            node_labels = {k: f"{str(k)}: {v}" for k, v in node_labels.items()}
         nx.draw_networkx_labels(G, pos, labels=node_labels, font_size=8)
 
         # Edge weights and widths
@@ -425,20 +415,21 @@ class LIPE:
 
     def get_answers(self, question_id, include_question=True, merge_transcript_lines=True):
         ignored_topics = self.ignored_topics().union({-4, -1})
+        family_topics = self.questions[question_id].merged_descendants
         df = self.label_full_data()
         df.sort_values(by=[self.interview_col, self.line_col])
         keep = []
         capturing = False
         for index, row in df.iterrows():
             if capturing:
-                if row['topic'] not in ignored_topics and row['topic'] != question_id:
+                if row['topic'] not in ignored_topics and row['topic'] not in family_topics:
                     capturing = False
                 else:
                     if row[self.speaker_col] == 0 and not include_question:
                         continue
                     keep.append(index)
             else:
-                if row['topic'] == question_id:
+                if row['topic'] in family_topics:
                     capturing = True
                     if include_question:
                         keep.append(index)
@@ -450,36 +441,177 @@ class LIPE:
 
         return answers
 
+    def refit_outliers(self):
+        mask = self.interviewer_lines['topic'] == -1
+        texts = self.interviewer_lines.loc[mask, self.text_col].values
+        new_topics, new_probs = self.model.transform(texts)
+
+        new_topics = pd.Series(new_topics, index=self.interviewer_lines.index[mask])
+        new_probs = pd.Series(new_probs, index=self.interviewer_lines.index[mask])
+
+        for topic_id, question in self.questions.items():
+            if question.has_children:
+                sub_mask = new_topics == topic_id
+                if not sub_mask.any():
+                    continue
+                sub_texts = self.interviewer_lines.loc[new_topics[sub_mask].index, self.text_col].to_list()
+                sub_topics, sub_probs = question._split_state['model'].transform(sub_texts)
+
+                offset = question._split_state['offset']
+                sub_topics = pd.Series(sub_topics, index=new_topics[sub_mask].index) + offset
+                sub_topics = sub_topics.replace(offset - 1, question.topic_id)
+
+                sub_probs = pd.Series(sub_probs, index=new_probs[sub_mask].index)
+                combined_probs = 2 * new_probs[sub_mask] * sub_probs / (new_probs[sub_mask] + sub_probs)
+
+                sub_topics += question._split_state['offset']
+                new_topics[sub_mask] = sub_topics
+                new_probs[sub_mask] = 2 * new_probs[sub_mask] * sub_probs / (new_probs[sub_mask] + sub_probs)
+
+                new_topics[sub_mask] = sub_topics
+                new_probs[sub_mask] = combined_probs
+
+        self._refit_state = {
+            'index': new_topics.index.tolist(),
+            'topic': new_topics.to_list(),
+            'prob': new_probs.to_list(),
+            'text': texts
+        }
+
+        total = sum(mask)
+        reassigned = sum(new_topics != -1)
+        print(f"Reclassified {reassigned} out of {total} document(s). Use `examine_outliers()` to examine and `commit_outlier_refit()` to commit.")
+
+    def examine_outliers(self, lower_prob=0, upper_prob=1, topics=None, return_tuples=False):
+        if not hasattr(self, '_refit_state'):
+            self.refit_outliers()
+
+        df = pd.DataFrame(self._refit_state)
+        name_dict = dict(zip(self.topic_info['Topic'], self.topic_info['Name']))
+        topic_names = list(map(name_dict.get, self._refit_state['topic']))
+        df.insert(loc=1, column='topic_name', value=topic_names)
+
+        df = df[(df['prob'] >= lower_prob) & (df['prob'] <= upper_prob)]
+        if topics is not None:
+            df = df[df['topic'].isin(topics)]
+
+        df.sort_values(by=['topic', 'prob'], ascending=[True, False], inplace=True)
+
+        if return_tuples:
+            return list(zip(df['topic_name'], df['prob'], df['text']))
+        else:
+            return df
+
+    def commit_outlier_refit(self, lower_prob=0, upper_prob=1, topics=None):
+        if not hasattr(self, '_refit_state'):
+            raise RuntimeError("No reclassification found. Run `refit_outliers()` first.")
+
+        df = pd.DataFrame(self._refit_state)
+        df.set_index('index', inplace=True)
+
+        df = df[(df['prob'] >= lower_prob) & (df['prob'] <= upper_prob)]
+        if topics is not None:
+            df = df[df['topic'].isin(topics)]
+
+        if df.empty:
+            print("No outliers matched the provided criteria. Nothing committed.")
+            return
+
+        self.interviewer_lines.loc[df.index, 'topic'] = df['topic'].values
+        self.interviewer_lines.loc[df.index, 'topic_prob'] = df['prob'].values
+
+        print(f"Committed {len(df)} reclassified outlier(s).")
+
 
 class ProtocolQuestion:
-    def __init__(self, topic_id, lipe):
+    def __init__(self, topic_id, lipe, parent=None):
         self.topic_id = topic_id
         self.lipe = lipe  # back-reference to parent
-        self._info = self.lipe.topic_info[self.lipe.topic_info.Topic == topic_id].iloc[0]
-        self.label = self._info['Name']
+        if parent is not None:
+            self.label = '_'.join([str(topic_id)] + self.representative_words[:4])
         self.ignore = False
+        self._parent = parent
+        self._family = {topic_id}
 
-    def get_examples(self, n=5, example_type="mixed", show_unprocessed=True):
-        return self.lipe.detailed_examples(topics=[self.topic_id],
-                                           n=n,
-                                           example_type=example_type,
-                                           show_unprocessed=show_unprocessed)['examples'].iloc[0]
+    @property
+    def label(self):
+        topic_info = self.lipe.topic_info
+        return topic_info.loc[topic_info['Topic'] == self.topic_id, 'Name'].iloc[0]
+
+    @label.setter
+    def label(self, value):
+        topic_info = self.lipe.topic_info
+        topic_info.loc[topic_info['Topic'] == self.topic_id, 'Name'] = value
+
+    @property
+    def representative_words(self):
+        topic_info = self.lipe.topic_info
+        return topic_info.loc[topic_info['Topic'] == self.topic_id, 'Representation'].iloc[0]
+
+    @property
+    def count(self):
+        topic_info = self.lipe.topic_info
+        return topic_info.loc[topic_info['Topic'] == self.topic_id, 'Count'].iloc[0]
+
+    def get_examples(self, n=5, show_processed=False, hide_probs=False):
+        examples = self.lipe.detailed_examples(topics=[self.topic_id],
+                                               n=n,
+                                               show_processed=show_processed)['examples'].iloc[0]
+        if hide_probs:
+            examples = [text for _, text in examples]
+
+        return examples
+
+    def get_questions(self):
+        mask = self.lipe.interviewer_lines['topic'] == self.topic_id
+        texts = self.lipe.interviewer_lines.loc[mask, self.lipe.text_col].values
+        return texts
 
     def get_answers(self, include_question=True, merge_transcript_lines=True):
         return self.lipe.get_answers(self.topic_id, include_question=include_question,
                                      merge_transcript_lines=merge_transcript_lines)
 
     @property
-    def representative_words(self):
-        return self._info['Representation']
-
-    @property
-    def count(self):
-        return self._info['Count']
-
-    @property
     def has_split(self):
         return hasattr(self, '_split_state')
+
+    @property
+    def children(self):
+        return self._family - {self.topic_id}
+
+    @property
+    def has_children(self):
+        return len(self.children) > 0
+
+    @property
+    def merges(self):
+        return {k for k, v in self.lipe.question_merges.items() if v == self.topic_id}
+
+    @property
+    def descendants(self):
+        to_check = self.children.copy()
+        checked = {self.topic_id}
+
+        while to_check:
+            check = to_check.pop()
+            if check not in checked:
+                if self.lipe.questions[check].has_children:
+                    to_check.update(self.lipe.questions[check].children)
+                checked.add(check)
+        return checked
+
+    @property
+    def merged_descendants(self):
+        to_check = {self.topic_id}
+        checked = set()
+
+        while to_check:
+            check = to_check.pop()
+            if check not in checked:
+                checked.add(check)
+                to_check.update(self.lipe.questions[check].descendants)
+                to_check.update(self.lipe.questions[check].merges)
+        return checked
 
     @property
     def split_preview(self):
@@ -487,32 +619,48 @@ class ProtocolQuestion:
             return None
         return self._split_state['model'].get_topic_info()
 
-    def split(self, min_topic_size, custom_model=None, embedding_model_name=None, random_state=42):
+    @property
+    def root_topic(self):
+        root = self.topic_id
+        while root in self.lipe.question_merges:
+            root = self.lipe.question_merges[root]
+        return root
+
+    def split(self, min_topic_size, custom_model=None, embedding_model_name=None, tm_preprocessor=None, random_state=42):
         # Extract relevant interviewer lines
         mask = self.lipe.interviewer_lines['topic'] == self.topic_id
-        texts = self.lipe.interviewer_lines.loc[mask, self.lipe.text_col].tolist()
+        texts = self.lipe.interviewer_lines.loc[mask, self.lipe.text_col]
 
-        if not texts:
+        if len(texts) < 1:
             raise ValueError(f"No documents found for topic {self.topic_id}.")
 
         # Use user-provided or new model
         if custom_model:
             model = custom_model
         else:
-            embed_model = SentenceTransformer(embedding_model_name or self.lipe.embedding_model_name)
+            embedding_model_name = embedding_model_name or self.lipe.embedding_model_name
+            embed_model = SentenceTransformer(embedding_model_name)
             umap_model = UMAP(n_neighbors=min_topic_size, n_components=5, min_dist=0.0,
                               metric='cosine', random_state=random_state)
-            hdbscan_model = HDBSCAN(min_cluster_size=min_topic_size, min_samples=max(1, min_topic_size // 2))
+            hdbscan_model = HDBSCAN(min_cluster_size=min_topic_size,
+                                    min_samples=max(1, min_topic_size // 2),
+                                    metric='euclidean',
+                                    cluster_selection_method='eom',
+                                    prediction_data=True)
             model = BERTopic(embedding_model=embed_model,
                              umap_model=umap_model,
                              hdbscan_model=hdbscan_model,
                              min_topic_size=min_topic_size)
 
-        new_topics, _ = model.fit_transform(texts)
+        if tm_preprocessor:
+            texts = texts.apply(tm_preprocessor)
+        new_topics, new_probs = model.fit_transform(texts.to_list())
 
         self._split_state = {
+            'mask': mask,
             'model': model,
             'new_topics': new_topics,
+            'new_probs': new_probs,
             'docs': texts
         }
         return self._split_state['model'].get_topic_info()
@@ -523,31 +671,90 @@ class ProtocolQuestion:
             docs = random.sample(docs, n)
         return docs
 
+    def visualize_split_documents(self):
+        docs = self.lipe.interviewer_lines[self._split_state['mask']][self.lipe.text_col].to_list()
+        return self._split_state['model'].visualize_documents(docs)
+
 # WIP
 #    def reduce_split_outliers(self, strategy='distributions', final=False):
 #        new_topics = topic_model.reduce_outliers(self._split_state['docs'], self._split_state['new_topics'], strategy=strategy)
 
-    def commit_split(self, min_similarity=0.9):
+    def commit_split(self):
         """
-        Merge the split subtopics into the main LIPE model using BERTopic's merge_models.
+        Register the split topics as part of LIPE while keeping the old topics
         """
         if not hasattr(self, '_split_state'):
             raise RuntimeError("No split has been run. Call `.split()` first.")
+        elif self.has_children:
+            raise RuntimeError(f"Question is already split into questions: {', '.join([str(i) for i in self.children])}")
 
-        split_model = self._split_state['model']
+        # Update LIPE topic labels and probabilities (using harmonic mean)
+        next_index = self.lipe.next_question_index()
+        self._split_state['offset'] = next_index
+        adjusted_topics = pd.Series(self._split_state['new_topics']) + next_index
+        adjusted_topics = adjusted_topics.replace(next_index - 1, self.topic_id)
 
-        # Remove the topic from the main model
-        self.lipe.model.remove_topic(self.topic_id)
-        del self.lipe.questions[self.topic_id]
+        old_probs = self.lipe.interviewer_lines.loc[self._split_state['mask'], 'topic_prob'].values
+        self._split_state['old_probs'] = old_probs
+        new_probs = np.asarray(self._split_state['new_probs'])
+        adjusted_probs = 2 * old_probs * new_probs / (old_probs + new_probs)
 
-        # Merge the split model into the main model
-        self.lipe.model = BERTopic.merge_models(
-            [self.lipe.model, split_model],
-            min_similarity=min_similarity
-        )
+        self.lipe.interviewer_lines.loc[self._split_state['mask'], 'topic'] = adjusted_topics.values
+        self.lipe.interviewer_lines.loc[self._split_state['mask'], 'topic_prob'] = adjusted_probs
 
-        # Reassign topics in the LIPE model
-        self.lipe._reassign_topics()
+        # Update question children
+        self._family = set(adjusted_topics)
 
-        # Clean up the split state
-        del self._split_state
+        # Update LIPE.topic_info
+        new_topic_info = self._split_state['model'].get_topic_info().copy()
+        if new_topic_info.iloc[0, 0] == -1:
+            new_topic_info.drop(index=0, inplace=True)
+        new_topic_info['Topic'] += next_index
+        new_topic_info['Parent_Topic'] = self.topic_id
+
+        self.lipe.topic_info = pd.concat([self.lipe.topic_info, new_topic_info], ignore_index=True)
+
+        # Update LIPE.questions
+        for topic_id in new_topic_info['Topic']:
+            self.lipe.questions[topic_id] = ProtocolQuestion(topic_id, self.lipe, self.topic_id)
+
+    def unsplit(self):
+        if not self.has_children:
+            raise RuntimeError("Question currently has no children to unsplit")
+
+        self.lipe.interviewer_lines.loc[self._split_state['mask'], 'topic'] = self.topic_id
+        self.lipe.interviewer_lines.loc[self._split_state['mask'], 'topic_prob'] = self._split_state['old_probs']
+        del self._split_state['old_probs']
+        del self._split_state['offset']
+        to_remove = self.children
+        self._family = {self.topic_id}
+        self.lipe.topic_info = self.lipe.topic_info[~self.lipe.topic_info['Topic'].isin(to_remove)]
+        self.lipe.question_merges = {k: v for k, v in self.lipe.question_merges.items() if not (k in to_remove or v in to_remove)}
+        for i in to_remove:
+            del self.lipe.questions[i]
+
+    def merge_with(self, topic_id):
+        loop = forms_loop(self.lipe.question_merges, self.topic_id, topic_id)
+        if loop:
+            raise RuntimeError(f"Merge would form a loop: {loop}")
+        else:
+            self.lipe.question_merges.update({self.topic_id: topic_id})
+
+    def unmerge(self):
+        if self.topic_id in self.lipe.question_merges:
+            parent = self.lipe.question_merges.pop(self.topic_id)
+            print(f"Question {self.topic_id} unmerged from {parent}")
+        else:
+            raise RuntimeError(f"Question {self.topic_id} is not merged")
+
+
+def forms_loop(links, origin, target):
+    path = f"{origin} -> {target}"
+    if target == origin:
+        return path
+    while target in links:
+        target = links[target]
+        path += " -> " + str(target)
+        if target == origin:
+            return path
+    return False
