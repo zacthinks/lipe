@@ -1,15 +1,19 @@
-import pandas as pd
-import numpy as np
-from collections import Counter
-from bertopic import BERTopic
-from umap import UMAP
-from hdbscan import HDBSCAN
-from scipy.cluster import hierarchy as sch
-from sentence_transformers import SentenceTransformer
-import networkx as nx
-import matplotlib.pyplot as plt
-import warnings
+import os
+import re
 import random
+import warnings
+from collections import Counter
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import networkx as nx
+from scipy.cluster import hierarchy as sch
+
+from bertopic import BERTopic
+from hdbscan import HDBSCAN
+from sentence_transformers import SentenceTransformer
+from umap import UMAP
 
 
 def e5_preprocessor(s):
@@ -19,9 +23,12 @@ def e5_preprocessor(s):
 def linkage_function(x):
     return sch.linkage(x, 'single', optimal_ordering=True)
 
+
+def slugify(text):
+    return re.sub(r'\W+', '_', text.strip()).strip('_')
+
+
 # BERTopic monkey-patch for topic removal
-
-
 def remove_topic(self, topic_id: int):
     # 1. Safety checks
     if self.topic_representations_ is None:
@@ -142,7 +149,7 @@ class LIPE:
         self.model = model
 
         # Prepare interviewer lines
-        self.interviewer_lines = self.data[self.data[speaker_col] == interviewer_id].reset_index(drop=True)
+        self.interviewer_lines = self.data[self.data[speaker_col] == interviewer_id]
 
         if tm_preprocessor:
             self.interviewer_lines_preprocessed = self.interviewer_lines[self.text_col].apply(tm_preprocessor).to_list()
@@ -252,7 +259,7 @@ class LIPE:
     def label_full_data(self):
         self.data['topic'] = -4
         interviewer_mask = self.data[self.speaker_col] == self.interviewer_id
-        self.data.loc[interviewer_mask, 'topic'] = self.interviewer_lines['topic']
+        self.data.loc[interviewer_mask, 'topic'] = self.interviewer_lines['topic'].to_numpy()
         return self.data
 
     def ignored_topics(self, include_merge_outliers=False):
@@ -441,6 +448,39 @@ class LIPE:
 
         return answers
 
+    def export_answers(self, folder, use_graph_topics=True, topics=None, transcript_labels=None):
+        os.makedirs(folder, exist_ok=True)
+        if use_graph_topics:
+            topic_ids = list(self.graph.nodes)
+        else:
+            topic_ids = topics if topics is not None else self.questions.keys()
+
+        for topic_id in topic_ids:
+            if topic_id not in self.questions:
+                continue
+
+            question = self.questions[topic_id]
+            df = question.get_answers()
+
+            if df.empty:
+                continue
+
+            df = df[[self.interview_col, self.line_col, self.speaker_col, self.text_col]].copy()
+            df.rename(columns={
+                self.interview_col: "interview_id",
+                self.line_col: "line_id",
+                self.speaker_col: "speaker_id",
+                self.text_col: "text"
+            }, inplace=True)
+
+            if transcript_labels is not None:
+                df.insert(1, "transcript_label", df["interview_id"].map(transcript_labels))
+
+            label = slugify(question.label)
+            filename = f"{topic_id}_{label}.csv"
+            filepath = os.path.join(folder, filename)
+            df.to_csv(filepath, index=False)
+
     def refit_outliers(self):
         mask = self.interviewer_lines['topic'] == -1
         texts = self.interviewer_lines.loc[mask, self.text_col].values
@@ -620,6 +660,47 @@ class LIPE:
         if not skipped.empty:
             bad_ids = sorted(skipped['manual_topic'].unique())
             print(f"Ignored {len(skipped)} invalid reassignment(s) to unknown topic(s): {bad_ids}")
+
+    def export_interviews(self, folder,
+                          transcript_labels=None,
+                          speaker_labels=None,
+                          speaker_prefix='Speaker_',
+                          exclude_topics=None):
+        os.makedirs(folder, exist_ok=True)
+        exclude_topics = set(exclude_topics or [])
+
+        df = self.label_full_data().copy()
+        df.sort_values(by=[self.interview_col, self.line_col], inplace=True)
+
+        if speaker_labels is not None:
+            df[self.speaker_col] = df[self.speaker_col].map(speaker_labels).fillna(df[self.speaker_col])
+        else:
+            df[self.speaker_col] = df[self.speaker_col].map(lambda s: f"{speaker_prefix}{str(s)}")
+
+        ignore_mask = [False] * len(df)
+        if exclude_topics:
+            for topic in exclude_topics:
+                exclude_df = self.get_answers(topic, include_question=True, merge_transcript_lines=False)
+                ignore_mask = df.index.isin(exclude_df.index) | ignore_mask
+            df = df[~ignore_mask]
+
+        for interview_id, group in df.groupby(self.interview_col):
+            lines = []
+            for _, row in group.iterrows():
+                speaker = row[self.speaker_col]
+                line = row[self.text_col].strip()
+                if line:
+                    lines.append(f"{speaker}: {line}")
+
+            if transcript_labels is not None:
+                name = transcript_labels[interview_id] if interview_id in transcript_labels else None
+            else:
+                name = ""
+            filename = f"{interview_id}_{name}.txt"
+            filepath = os.path.join(folder, filename)
+
+            with open(filepath, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines))
 
 
 class ProtocolQuestion:
