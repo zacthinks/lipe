@@ -22,6 +22,9 @@
 
 ## TODO
 - Saving/loading functionality
+- Interview lines export with subsetting
+- Include more outlier reduction strategies
+- ~~Manual relabeling~~
 - ~~Topic merging/splitting. It's still very buggy and BERTopic doesn't make it easy to modify fitted models.~~
 - Question-level EDA
 - Fit new interviewer lines

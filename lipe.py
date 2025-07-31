@@ -464,7 +464,6 @@ class LIPE:
                 sub_probs = pd.Series(sub_probs, index=new_probs[sub_mask].index)
                 combined_probs = 2 * new_probs[sub_mask] * sub_probs / (new_probs[sub_mask] + sub_probs)
 
-                sub_topics += question._split_state['offset']
                 new_topics[sub_mask] = sub_topics
                 new_probs[sub_mask] = 2 * new_probs[sub_mask] * sub_probs / (new_probs[sub_mask] + sub_probs)
 
@@ -487,6 +486,8 @@ class LIPE:
             self.refit_outliers()
 
         df = pd.DataFrame(self._refit_state)
+        df.set_index('index', inplace=True)
+
         name_dict = dict(zip(self.topic_info['Topic'], self.topic_info['Name']))
         topic_names = list(map(name_dict.get, self._refit_state['topic']))
         df.insert(loc=1, column='topic_name', value=topic_names)
@@ -498,7 +499,7 @@ class LIPE:
         df.sort_values(by=['topic', 'prob'], ascending=[True, False], inplace=True)
 
         if return_tuples:
-            return list(zip(df['topic_name'], df['prob'], df['text']))
+            return list(zip(df.index, df['topic_name'], df['prob'], df['text']))
         else:
             return df
 
@@ -521,6 +522,104 @@ class LIPE:
         self.interviewer_lines.loc[df.index, 'topic_prob'] = df['prob'].values
 
         print(f"Committed {len(df)} reclassified outlier(s).")
+
+    def export_outlier_refit(self, path, lower_prob=0, upper_prob=1, topics=None):
+        if not hasattr(self, '_refit_state'):
+            raise RuntimeError("No reclassification found. Run `refit_outliers()` first.")
+
+        df = pd.DataFrame(self._refit_state)
+        df.index = self._refit_state['index']
+
+        name_dict = dict(zip(self.topic_info['Topic'], self.topic_info['Name']))
+        topic_names = list(map(name_dict.get, self._refit_state['topic']))
+        df.insert(loc=1, column='refit_topic_name', value=topic_names)
+
+        df = df[(df['prob'] >= lower_prob) & (df['prob'] <= upper_prob)]
+        if topics is not None:
+            df = df[df['topic'].isin(topics)]
+
+        df.sort_values(by=['topic', 'prob'], ascending=[True, False], inplace=True)
+
+        df = df.rename(columns={
+            'topic': 'refit_topic',
+            'prob': 'refit_prob'
+        })
+
+        df['topic'] = -1
+        df['manual_topic'] = ""
+        df = df[['text', 'topic', 'refit_topic', 'refit_topic_name', 'refit_prob', 'manual_topic']]
+        df.index.name = 'index'
+
+        df.to_csv(path)
+        print(f"Exported {len(df)} reclassified outlier(s) to {path}")
+
+    def export_assignments(self, indexes, path):
+        df = self.interviewer_lines.loc[indexes, [self.text_col, 'topic']].copy()
+        df.index.name = 'index'
+
+        name_dict = dict(zip(self.topic_info['Topic'], self.topic_info['Name']))
+        df['topic_name'] = df['topic'].map(name_dict)
+        df['manual_topic'] = ""
+
+        # Reorder columns
+        df = df[['text', 'topic', 'topic_name', 'manual_topic']]
+
+        df.to_csv(path)
+        print(f"Exported {len(df)} assignment row(s) to {path}")
+
+    def manual_reassign(self, reassignments: dict, default_prob=1.0):
+        """
+        Manually reassign interviewer lines to existing topics.
+
+        Parameters:
+        - reassignments (dict): {row_index: topic_id} for rows in interviewer_lines
+        - default_prob (float): Probability value to assign for manual reassignments
+        """
+        known_topics = set(self.questions.keys())
+        valid = {idx: tid for idx, tid in reassignments.items() if tid in known_topics}
+        invalid = {idx: tid for idx, tid in reassignments.items() if tid not in known_topics}
+
+        if invalid:
+            print(f"Ignored {len(invalid)} invalid reassignments to unknown topic IDs: {set(invalid.values())}")
+
+        if not valid:
+            print("No valid reassignments found.")
+            return
+
+        indices = list(valid.keys())
+        topic_ids = list(valid.values())
+        self.interviewer_lines.loc[indices, 'topic'] = topic_ids
+        self.interviewer_lines.loc[indices, 'topic_prob'] = default_prob
+
+        counts = self.interviewer_lines['topic'].value_counts()
+        self.topic_info['Count'] = self.topic_info['Topic'].map(counts).fillna(0).astype('Int64')
+
+        print(f"Manually reassigned {len(valid)} line(s).")
+
+    def import_assignments(self, path, default_prob=1.0):
+        df = pd.read_csv(path, index_col='index')
+
+        if 'manual_topic' not in df.columns:
+            raise ValueError("CSV must include a 'manual_topic' column.")
+
+        df = df.dropna(subset=['manual_topic'])
+
+        df['manual_topic'] = df['manual_topic'].astype(int)
+
+        known = set(self.questions.keys())
+        valid = df[df['manual_topic'].isin(known)]
+        skipped = df[~df['manual_topic'].isin(known)]
+
+        self.interviewer_lines.loc[valid.index, 'topic'] = valid['manual_topic'].values
+        self.interviewer_lines.loc[valid.index, 'topic_prob'] = default_prob
+
+        counts = self.interviewer_lines['topic'].value_counts()
+        self.topic_info['Count'] = self.topic_info['Topic'].map(counts).fillna(0).astype('Int64')
+
+        print(f"Imported {len(valid)} manual reassignment(s).")
+        if not skipped.empty:
+            bad_ids = sorted(skipped['manual_topic'].unique())
+            print(f"Ignored {len(skipped)} invalid reassignment(s) to unknown topic(s): {bad_ids}")
 
 
 class ProtocolQuestion:
