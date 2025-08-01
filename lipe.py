@@ -14,6 +14,15 @@ from bertopic import BERTopic
 from hdbscan import HDBSCAN
 from sentence_transformers import SentenceTransformer
 from umap import UMAP
+from wordcloud import WordCloud
+
+from sklearn.feature_extraction.text import CountVectorizer, TfidfTransformer
+from sklearn.decomposition import LatentDirichletAllocation
+
+import spacy
+from spacy.pipeline import Sentencizer
+from spacy.util import is_package
+import spacy.cli
 
 
 def e5_preprocessor(s):
@@ -168,6 +177,10 @@ class LIPE:
         counts = Counter(topic_labels)
         self.topic_info['Count'] = self.topic_info['Topic'].map(counts)
 
+    @property
+    def topic_map(self):
+        return {q.topic_id: q.root_topic for q in self.questions.values()}
+
     def _load_topic_model(self, random_state=42):
         embed_model = SentenceTransformer(self.embedding_model_name)
         umap_model = UMAP(n_neighbors=self.min_topic_size,
@@ -185,9 +198,17 @@ class LIPE:
                         hdbscan_model=hdbscan_model,
                         min_topic_size=self.min_topic_size)
 
-    @property
-    def topic_map(self):
-        return {q.topic_id: q.root_topic for q in self.questions.values()}
+    def load_spacy(self, model="en_core_web_sm", disable=("parser", "ner")):
+        try:
+            self.spacy_model = spacy.load(model, disable=disable)
+        except OSError:
+            if not is_package(model):
+                raise ValueError(f"spaCy model '{model}' not found and not downloadable.")
+            try:
+                spacy.cli.download(model)
+                self.spacy_model = spacy.load(model, disable=disable)
+            except Exception as e:
+                raise ValueError(f"Failed to download and load spaCy model '{model}': {e}")
 
     def next_question_index(self):
         return max(self.questions.keys()) + 1
@@ -453,7 +474,7 @@ class LIPE:
         if use_graph_topics:
             topic_ids = list(self.graph.nodes)
         else:
-            topic_ids = topics if topics is not None else self.questions.keys()
+            topic_ids = topics if topics is not None else list(self.questions.keys())
 
         for topic_id in topic_ids:
             if topic_id not in self.questions:
@@ -702,6 +723,53 @@ class LIPE:
             with open(filepath, "w", encoding="utf-8") as f:
                 f.write("\n".join(lines))
 
+    def export_answer_visuals(self, folder, type='bar', use_tfidf=False, use_graph_topics=True, topics=None):
+        os.makedirs(folder, exist_ok=True)
+        if use_graph_topics:
+            topic_ids = list(self.graph.nodes)
+        else:
+            topic_ids = topics if topics is not None else list(self.questions.keys())
+
+        for topic_id in topic_ids:
+            if topic_id not in self.questions:
+                continue
+
+            question = self.questions[topic_id]
+            label = slugify(question.label)
+            filename = f"{topic_id}_{label}.png"
+            filepath = os.path.join(folder, filename)
+
+            if type == 'bar':
+                question.visualize_answers_bar(use_tfidf=use_tfidf, save_path=filepath)
+            elif type == 'cloud':
+                question.visualize_answers_cloud(use_tfidf=use_tfidf, save_path=filepath)
+            else:
+                raise ValueError(f"Unrecognized visual type: {type}.")
+
+    def export_answer_lda_topics(self, folder,
+                                 top_terms_n=10, top_docs_n=5, method="prob", transcript_labels=None,
+                                 use_graph_topics=True, topics=None):
+        os.makedirs(folder, exist_ok=True)
+        if use_graph_topics:
+            topic_ids = list(self.graph.nodes)
+        else:
+            topic_ids = topics if topics is not None else list(self.questions.keys())
+
+        for topic_id in topic_ids:
+            if topic_id not in self.questions:
+                continue
+
+            question = self.questions[topic_id]
+            label = slugify(question.label)
+            filename = f"{topic_id}_{label}.csv"
+            filepath = os.path.join(folder, filename)
+
+            df = question.get_answers_tm_lda_topics(top_terms_n=top_terms_n,
+                                                    top_docs_n=top_docs_n,
+                                                    method=method,
+                                                    transcript_labels=transcript_labels)
+            df.to_csv(filepath)
+
 
 class ProtocolQuestion:
     def __init__(self, topic_id, lipe, parent=None):
@@ -926,6 +994,282 @@ class ProtocolQuestion:
             print(f"Question {self.topic_id} unmerged from {parent}")
         else:
             raise RuntimeError(f"Question {self.topic_id} is not merged")
+
+    def get_answer_dtm(self,
+                       lemmatize=True,
+                       lowercase=True,
+                       remove_numbers=True,
+                       remove_punctuation=True,
+                       custom_stopwords=None,
+                       keep_words=None):
+        df = self.get_answers(include_question=False, merge_transcript_lines=True)
+
+        if not hasattr(self.lipe, "spacy_model"):
+            self.lipe.load_spacy()
+        nlp = self.lipe.spacy_model
+
+        custom_stopwords = set(custom_stopwords or [])
+        keep_words = set(keep_words or [])
+
+        def token_form(token):
+            text = token.lemma_ if lemmatize else token.text
+            return text.lower() if lowercase else text
+
+        def spacy_tokenizer(text):
+            doc = nlp(text)
+            return [
+                t for token in doc for t in [token_form(token)]
+                if (
+                    not (remove_numbers and token.is_digit)
+                    and not (remove_punctuation and token.is_punct)
+                    and not ((t in custom_stopwords) or (token.is_stop and t not in keep_words))
+                )
+            ]
+
+        vectorizer = CountVectorizer(tokenizer=spacy_tokenizer, lowercase=False)
+        dtm = vectorizer.fit_transform(df[self.lipe.text_col])
+
+        self._answer_dtm = dtm
+        self._answer_dtm_index = df[self.lipe.interview_col].tolist()
+        self._answer_vocab = vectorizer.get_feature_names_out()
+        self._answer_vectorizer = vectorizer
+        return dtm
+
+    def get_answer_tf_idf(self):
+        if not hasattr(self, "_answer_dtm"):
+            self.get_answer_dtm()
+        transformer = TfidfTransformer()
+        tfidf_matrix = transformer.fit_transform(self._answer_dtm)
+        return tfidf_matrix
+
+    def get_top_words(self, top_n=20, sort_by='count', ascending=False):
+        if not hasattr(self, "_answer_dtm"):
+            self.get_answer_dtm()
+
+        tfidf = self.get_answer_tf_idf()
+        n_docs = self._answer_dtm.shape[0]
+
+        # Total term frequency (across all docs)
+        counts = self._answer_dtm.sum(axis=0).A1
+
+        # Document frequency (non-zero rows per column)
+        doc_freq = np.array((self._answer_dtm > 0).sum(axis=0)).ravel()
+        doc_prop = doc_freq / n_docs
+
+        # TF-IDF summed over all docs
+        tfidf_sum = tfidf.sum(axis=0).A1
+
+        df = pd.DataFrame({
+            'word': self._answer_vocab,
+            'count': counts,
+            'doc_freq': doc_freq,
+            'doc_prop': doc_prop,
+            'tfidf': tfidf_sum
+        })
+
+        df = df.sort_values(by=sort_by, ascending=ascending).head(top_n)
+        return df.reset_index(drop=True)
+
+    def visualize_answers_cloud(self,
+                                use_tfidf=False,
+                                max_words=100,
+                                width=800,
+                                height=400,
+                                background_color='white',
+                                colormap=None,
+                                prefer_horizontal=0.9,
+                                scale=1,
+                                relative_scaling='auto',
+                                normalize_plurals=True,
+                                contour_color='black',
+                                contour_width=0,
+                                save_path=None):
+        if use_tfidf:
+            matrix = self.get_answer_tf_idf()
+        else:
+            if not hasattr(self, "_answer_dtm"):
+                self.get_answer_dtm()
+            matrix = self._answer_dtm
+
+        weights = matrix.sum(axis=0).A1
+        freqs = dict(zip(self._answer_vocab, weights))
+
+        wc = WordCloud(width=width,
+                       height=height,
+                       background_color=background_color,
+                       max_words=max_words,
+                       colormap=colormap,
+                       prefer_horizontal=prefer_horizontal,
+                       scale=scale,
+                       relative_scaling=relative_scaling,
+                       normalize_plurals=normalize_plurals,
+                       contour_color=contour_color,
+                       contour_width=contour_width
+                       ).generate_from_frequencies(freqs)
+
+        plt.figure(figsize=(width / 100, height / 100))
+        plt.imshow(wc, interpolation="bilinear")
+        plt.axis("off")
+        label = self.label if hasattr(self, "label") else self.topic_id
+        plt.title(f"Word Cloud for Question {label}")
+
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            plt.close()
+        else:
+            plt.show()
+
+    def visualize_answers_bar(self, top_n=20, use_tfidf=False,
+                              figsize=(10, 6),
+                              color='skyblue',
+                              save_path=None):
+        if use_tfidf:
+            matrix = self.get_answer_tf_idf()
+        else:
+            if not hasattr(self, "_answer_dtm"):
+                self.get_answer_dtm()
+            matrix = self._answer_dtm
+
+        weights = matrix.sum(axis=0).A1
+        freqs = pd.Series(weights, index=self._answer_vocab)
+        top_words = freqs.sort_values(ascending=False).head(top_n)
+
+        plt.figure(figsize=figsize)
+        top_words.sort_values().plot(kind="barh", color=color)
+        label = self.label if hasattr(self, "label") else self.topic_id
+        plt.title(f"Top {top_n} Words for Question {label}")
+        plt.xlabel("TF-IDF Score" if use_tfidf else "Count")
+        plt.tight_layout()
+
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            plt.close()
+        else:
+            plt.show()
+
+    def fit_answers_tm_bertopic(self, embedding_model=None, processor=None,
+                                min_topic_size=5, spacy_language_code="en"):
+        answers_df = self.get_answers(include_question=False, merge_transcript_lines=True)
+
+        nlp = spacy.blank(spacy_language_code)
+        nlp.add_pipe("sentencizer")
+
+        all_sentences = []
+        for _, row in answers_df.iterrows():
+            doc = nlp(row[self.lipe.text_col])
+            all_sentences.extend([
+                (row[self.lipe.interview_col], i, sent.text.strip())
+                for i, sent in enumerate(doc.sents)
+            ])
+        sent_df = pd.DataFrame(all_sentences, columns=["transcript_id", "sentence_id", "sentence"])
+
+        if embedding_model is None:
+            embedding_model = SentenceTransformer("intfloat/e5-base-v2")
+            if processor is None:
+                processor = e5_preprocessor
+
+        texts = sent_df["sentence"]
+        if processor is not None:
+            texts = texts.apply(processor)
+
+        tm = BERTopic(embedding_model=embedding_model, min_topic_size=min_topic_size)
+        topics, probs = tm.fit_transform(texts.tolist())
+        sent_df["topic"] = topics
+
+        self.answers_sentences = sent_df
+        self.answers_bertopic = tm
+
+        return tm.get_topic_info()
+
+    def fit_answers_tm_lda(self, n_topics=10):
+        if not hasattr(self, "_answer_dtm") or self._answer_dtm is None:
+            self.get_answer_dtm()
+
+        lda = LatentDirichletAllocation(n_components=n_topics, random_state=42)
+        doc_topic_dist = lda.fit_transform(self._answer_dtm)
+        topic_word_dist = lda.components_
+
+        self.answer_tm_lda_doc_topic_dist = doc_topic_dist
+        self.answer_tm_lda_topic_word_dist = topic_word_dist
+
+        return self.get_answers_tm_lda_topics()
+
+    def get_answers_tm_lda_docs(self, top_k=3):
+        if not hasattr(self, "answer_tm_lda_doc_topic_dist") or self.answer_tm_lda_doc_topic_dist is None:
+            self.fit_answers_tm_lda()
+
+        dist = self.answer_tm_lda_doc_topic_dist
+        doc_ids = self._answer_dtm_index
+
+        top_indices = np.argsort(-dist, axis=1)[:, :top_k]
+        top_scores = np.take_along_axis(dist, top_indices, axis=1)
+
+        data = []
+        for i, doc_id in enumerate(doc_ids):
+            row = {"doc_id": doc_id}
+            for j in range(top_k):
+                row[f"topic_{j+1}"] = top_indices[i, j]
+                row[f"score_{j+1}"] = top_scores[i, j]
+            data.append(row)
+
+        return pd.DataFrame(data)
+
+    def get_answers_tm_lda_topics(self, top_terms_n=10, top_docs_n=5, method="prob", transcript_labels=None):
+        if not hasattr(self, "answer_tm_lda_doc_topic_dist") or self.answer_tm_lda_doc_topic_dist is None:
+            self.fit_answers_tm_lda()
+
+        topic_word = self.answer_tm_lda_topic_word_dist
+        doc_topic = self.answer_tm_lda_doc_topic_dist
+        vocab = self._answer_vocab
+        doc_ids = np.array(self._answer_dtm_index)
+
+        n_topics = topic_word.shape[0]
+        word_scores = topic_word if method == "prob" else None
+
+        # Top topic per doc
+        top_topic_ids = doc_topic.argmax(axis=1)
+        topic_counts = pd.Series(top_topic_ids).value_counts().sort_index()
+        avg_prevalence = doc_topic.mean(axis=0)
+
+        # Compute exclusivity and FREX if needed
+        if method == "frex":
+            word_totals = topic_word.sum(axis=0)
+            exclusivity = topic_word / (word_totals + 1e-10)
+            word_scores = 2 * topic_word * exclusivity / (topic_word + exclusivity + 1e-10)
+
+        # Build top word lists with scores
+        top_words = {}
+        for i in range(n_topics):
+            scores = word_scores[i]
+            top_idx = scores.argsort()[::-1][:top_terms_n]
+            top_words[i] = [(vocab[j], float(scores[j])) for j in top_idx]
+
+        # Build top doc lists with labels and probs
+        top_docs = {}
+        for i in range(n_topics):
+            probs = doc_topic[:, i]
+            top_idx = probs.argsort()[::-1][:top_docs_n]
+            top_docs[i] = [
+                (transcript_labels.get(doc_ids[j], doc_ids[j]) if transcript_labels is not None else doc_ids[j], float(probs[j]))
+                for j in top_idx
+            ]
+
+        # Combine results
+        df = pd.DataFrame({
+            "topic": range(n_topics),
+            "num_docs": [topic_counts.get(i, 0) for i in range(n_topics)],
+            "avg_prevalence": avg_prevalence,
+            "top_words": [top_words[i] for i in range(n_topics)],
+            "top_docs": [top_docs[i] for i in range(n_topics)]
+        })
+
+        return df.sort_values('avg_prevalence', ascending=False)
+
+    def visualize_answers_tm_bertopic(self):
+        if not hasattr(self, "answer_bertopic"):
+            raise RuntimeError("No BERTopic model fitted yet. Run `fit_answers_tm_bertopic()` first.")
+
+        return self.answers_bertopic.visualize_documents(self.answers_sentences.sentence)
 
 
 def forms_loop(links, origin, target):
